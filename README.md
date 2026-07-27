@@ -439,6 +439,7 @@ Everything lives in `.env.local` (auto-created by `npm run setup`). See `.env.ex
 | `VOYAGE_API_KEY` **or** `OPENAI_API_KEY` | optional | Unlocks vector recall. Falls back to substring. |
 | `COMPOSIO_API_KEY` | optional | Enables integrations. Without it, plain chat + memory + automations still work. Get one at [app.composio.dev/developers](https://app.composio.dev/developers?utm_source=chris&utm_medium=youtube&utm_campaign=collab). |
 | `COMPOSIO_USER_ID` | optional | Stable user id Composio keys connections under. Defaults to `boop-default`. |
+| `COMPOSIO_GITHUB_AUTH_CONFIG_ID` / `COMPOSIO_GOOGLE_CAL_AUTH_CONFIG_ID` | optional | Pin GitHub or Google Calendar to a custom/BYO Composio auth config. Existing connected accounts must belong to `COMPOSIO_USER_ID`. |
 | `ANTHROPIC_API_KEY` | optional | Bypass the Claude Code subscription for the Claude runtime. |
 
 ---
@@ -505,6 +506,13 @@ Boop outsources 3rd-party service integrations to [Composio](https://composio.de
 2. Add it to `.env.local`:
    ```
    COMPOSIO_API_KEY=sk-comp-...
+   ```
+   If you created custom auth configs in Composio, also pin them and use the
+   same user id that owns the connected accounts:
+   ```
+   COMPOSIO_USER_ID=your-stable-composio-user-id
+   COMPOSIO_GITHUB_AUTH_CONFIG_ID=ac_...
+   COMPOSIO_GOOGLE_CAL_AUTH_CONFIG_ID=ac_...
    ```
 3. `npm run dev`.
 4. Open the debug dashboard → **Connections** tab. The connected and common integrations appear first, followed by the full Composio catalog with each toolkit's available tool count. Click **Connect**, authenticate on Composio's hosted page, and you are done. If a toolkit needs your own OAuth app, its row points to `platform.composio.dev/auth-configs` for the one-time setup.

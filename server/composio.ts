@@ -69,6 +69,20 @@ export function boopUserId(): string {
   return process.env.COMPOSIO_USER_ID ?? "boop-default";
 }
 
+const AUTH_CONFIG_ENV_ALIASES: Record<string, string[]> = {
+  github: ["COMPOSIO_GITHUB_AUTH_CONFIG_ID"],
+  googlecalendar: ["COMPOSIO_GOOGLE_CAL_AUTH_CONFIG_ID"],
+};
+
+export function configuredAuthConfigIdFor(slug: string): string | undefined {
+  const genericName = `COMPOSIO_${slug.replace(/[^a-z0-9]+/gi, "_").toUpperCase()}_AUTH_CONFIG_ID`;
+  for (const name of [...(AUTH_CONFIG_ENV_ALIASES[slug] ?? []), genericName]) {
+    const value = process.env[name]?.trim();
+    if (value) return value;
+  }
+  return undefined;
+}
+
 export function displayNameFor(slug: string): string {
   return DISPLAY_NAME_BY_SLUG.get(slug) ?? humanize(slug);
 }
@@ -84,6 +98,7 @@ function humanize(slug: string): string {
 export interface ConnectedToolkit {
   slug: string;
   connectionId: string;
+  authConfigId: string;
   status: string;
   alias?: string;
   accountLabel?: string;
@@ -390,6 +405,7 @@ export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
         return {
           slug: it.toolkit.slug,
           connectionId: it.id,
+          authConfigId: it.authConfig.id,
           status: it.status,
           alias: it.alias ?? undefined,
           accountLabel: identity.label,
@@ -405,6 +421,23 @@ export async function listConnectedToolkits(): Promise<ConnectedToolkit[]> {
     console.error("[composio] listConnectedToolkits failed", err);
     return [];
   }
+}
+
+export function selectActiveConnections(
+  connections: ConnectedToolkit[],
+  slug: string,
+  authConfigId = configuredAuthConfigIdFor(slug),
+): ConnectedToolkit[] {
+  return connections.filter(
+    (connection) =>
+      connection.slug === slug &&
+      connection.status === "ACTIVE" &&
+      (!authConfigId || connection.authConfigId === authConfigId),
+  );
+}
+
+async function activeConnectionsForToolkit(slug: string): Promise<ConnectedToolkit[]> {
+  return selectActiveConnections(await listConnectedToolkits(), slug);
 }
 
 function str(v: unknown): string | undefined {
@@ -501,6 +534,51 @@ export class ComposioNeedsAuthConfigError extends Error {
   }
 }
 
+async function authConfigIdForToolkit(
+  composio: NonNullable<ReturnType<typeof getComposio>>,
+  slug: string,
+  createManagedIfMissing: boolean,
+): Promise<string | undefined> {
+  const configuredId = configuredAuthConfigIdFor(slug);
+  if (configuredId) {
+    const configured = await composio.authConfigs.get(configuredId);
+    if (configured.toolkit.slug !== slug) {
+      throw new Error(
+        `[composio] configured auth config for ${slug} belongs to ${configured.toolkit.slug}`,
+      );
+    }
+    if (configured.status === "DISABLED") {
+      throw new Error(`[composio] configured auth config for ${slug} is disabled`);
+    }
+    return configuredId;
+  }
+
+  const connected = await composio.connectedAccounts.list({
+    userIds: [boopUserId()],
+    toolkitSlugs: [slug],
+    statuses: ["ACTIVE"],
+  });
+  if (connected.items[0]) return connected.items[0].authConfig.id;
+
+  const existing = (await composio.authConfigs.list({ toolkit: slug })).items[0];
+  if (existing) return existing.id;
+  if (!createManagedIfMissing) return undefined;
+
+  try {
+    const created = await composio.authConfigs.create(slug, {
+      type: "use_composio_managed_auth",
+      name: `${displayNameFor(slug)} Auth Config`,
+    });
+    return created.id;
+  } catch (err) {
+    const status = (err as { status?: number })?.status;
+    if (status === 400) {
+      throw new ComposioNeedsAuthConfigError(slug, String(err));
+    }
+    throw err;
+  }
+}
+
 export async function authorizeToolkit(
   slug: string,
   opts?: { callbackUrl?: string; alias?: string },
@@ -508,41 +586,15 @@ export async function authorizeToolkit(
   const composio = getComposio();
   if (!composio) throw new Error("COMPOSIO_API_KEY not set");
 
-  // 1. Find or create an auth config for the toolkit. session.authorize doesn't
-  //    auto-discover or auto-create — we have to pass an authConfigId explicitly
-  //    to connectedAccounts.initiate. That's why a manually-added BYO config in
-  //    the dashboard would still trip "require auth configs but none exist" on
-  //    the previous session.authorize-based code path.
-  let authConfigId: string;
-  const existingConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
-  if (existingConfig) {
-    authConfigId = existingConfig.id;
-  } else {
-    try {
-      const created = await composio.authConfigs.create(slug, {
-        type: "use_composio_managed_auth",
-        name: `${displayNameFor(slug)} Auth Config`,
-      });
-      authConfigId = created.id;
-    } catch (err) {
-      // 400 here means Composio doesn't host a managed OAuth app for this toolkit —
-      // user has to register their own at the toolkit's dev portal and add it via
-      // the Composio Dashboard (Toolkits → search → Add to project).
-      const status = (err as { status?: number })?.status;
-      if (status === 400) {
-        throw new ComposioNeedsAuthConfigError(slug, String(err));
-      }
-      throw err;
-    }
-  }
+  // 1. Find or create an auth config for the toolkit. Explicit env config wins,
+  //    then the active account's config, then the toolkit's first config.
+  const authConfigId = await authConfigIdForToolkit(composio, slug, true);
+  if (!authConfigId) throw new Error(`[composio] no auth config available for ${slug}`);
 
-  // 2. Initiate the connection. allowMultiple if there's already an active connection
-  //    so we add another account instead of replacing.
-  const existing = (await listConnectedToolkits()).filter(
-    (c) => c.slug === slug && c.status === "ACTIVE",
-  );
-  const conn = await composio.connectedAccounts.initiate(boopUserId(), authConfigId, {
-    ...(existing.length > 0 ? { allowMultiple: true } : {}),
+  // 2. Create a Connect Link. Composio is retiring initiate() for managed OAuth,
+  //    while link() works for both managed and custom OAuth configs and supports
+  //    multiple accounts by default.
+  const conn = await composio.connectedAccounts.link(boopUserId(), authConfigId, {
     ...(opts?.callbackUrl ? { callbackUrl: opts.callbackUrl } : {}),
     ...(opts?.alias ? { alias: opts.alias } : {}),
   });
@@ -568,18 +620,23 @@ export function buildComposioIntegrationModule(slug: string): IntegrationModule 
       // If the user has 2+ active connections for this toolkit, force Composio to
       // require explicit account selection per tool call — otherwise it silently
       // picks the default account.
-      const activeCount = (await listConnectedToolkits()).filter(
-        (c) => c.slug === slug && c.status === "ACTIVE",
-      ).length;
+      const active = await activeConnectionsForToolkit(slug);
+      const activeCount = active.length;
       // Look up the auth config explicitly. Without this, composio.create() tries
       // to auto-create one and 400s for BYO toolkits (Twitter etc.) that don't
       // have a managed OAuth app available — error message even names the fix:
       // "Please specify them in auth_configs."
-      const authConfig = (await composio.authConfigs.list({ toolkit: slug })).items[0];
+      const authConfigId =
+        (await authConfigIdForToolkit(composio, slug, false)) ?? active[0]?.authConfigId;
       const session = await composio.create(boopUserId(), {
         toolkits: [slug],
         manageConnections: false,
-        ...(authConfig ? { authConfigs: { [slug]: authConfig.id } } : {}),
+        ...(authConfigId ? { authConfigs: { [slug]: authConfigId } } : {}),
+        // A single active connection is deterministic: pin the actual connected
+        // account instead of asking the session to infer it from an auth config.
+        ...(activeCount === 1
+          ? { connectedAccounts: { [slug]: active[0]!.connectionId } }
+          : {}),
         ...(activeCount >= 2
           ? { multiAccount: { enable: true, requireExplicitSelection: true } }
           : {}),
@@ -596,9 +653,7 @@ export function buildComposioIntegrationModule(slug: string): IntegrationModule 
       if (!composio) {
         throw new Error(`[composio] cannot build ${slug} — COMPOSIO_API_KEY not set`);
       }
-      const active = (await listConnectedToolkits()).filter(
-        (c) => c.slug === slug && c.status === "ACTIVE",
-      );
+      const active = await activeConnectionsForToolkit(slug);
       const rawTools = await composio.tools.getRawComposioTools({
         toolkits: [slug],
         limit: 500,
